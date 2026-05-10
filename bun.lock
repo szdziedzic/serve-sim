@@ -6,10 +6,10 @@
       "name": "serve-sim-repo",
     },
     "packages/serve-sim": {
-      "name": "serve-sim",
-      "version": "0.1.13",
+      "name": "serve-sim-szdziedzic",
+      "version": "0.1.21",
       "bin": {
-        "serve-sim": "dist/serve-sim.js",
+        "serve-sim-szdziedzic": "dist/serve-sim.js",
       },
       "dependencies": {
         "inspect-webkit": "^0.0.3",
@@ -19,12 +19,12 @@
         "preact": "^10.29.1",
         "react": "^19.0.0",
         "react-dom": "^19.0.0",
-        "serve-sim-client": "workspace:*",
+        "serve-sim-client-szdziedzic": "workspace:*",
         "typescript": "^5.7.0",
       },
     },
     "packages/serve-sim-client": {
-      "name": "serve-sim-client",
+      "name": "serve-sim-client-szdziedzic",
       "version": "0.1.15",
       "dependencies": {
         "just-bash": "^2.14.0",
@@ -180,9 +180,9 @@
 
     "semver": ["semver@7.7.4", "", { "bin": { "semver": "bin/semver.js" } }, "sha512-vFKC2IEtQnVhpT78h1Yp8wzwrf8CM+MzKMHGJZfBtzhZNycRFnXsHk6E5TxIkkMsgNS7mdX3AGB7x2QM2di4lA=="],
 
-    "serve-sim": ["serve-sim@workspace:packages/serve-sim"],
+    "serve-sim-client-szdziedzic": ["serve-sim-client-szdziedzic@workspace:packages/serve-sim-client"],
 
-    "serve-sim-client": ["serve-sim-client@workspace:packages/serve-sim-client"],
+    "serve-sim-szdziedzic": ["serve-sim-szdziedzic@workspace:packages/serve-sim"],
 
     "simple-concat": ["simple-concat@1.0.1", "", {}, "sha512-cSFtAPtRhljv69IK0hTVZQ+OfE9nePi/rtJmw5UjHeVyVroEqJXP1sFztKUy1qU+xvz3u/sfYJLa947b7nAN2Q=="],
 

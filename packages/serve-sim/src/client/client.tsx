@@ -29,7 +29,7 @@ import {
   type DeviceType,
   type SimulatorOrientation,
   type StreamConfig,
-} from "serve-sim-client/simulator";
+} from "serve-sim-client-szdziedzic/simulator";
 import { LocationEmulationTool } from "./LocationEmulationTool";
 import { Panel, PanelCloseButton, PanelHeader, PanelTitle } from "./Panel";
 
