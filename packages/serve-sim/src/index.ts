@@ -6,10 +6,53 @@ import { homedir, networkInterfaces } from "os";
 import { join, resolve } from "path";
 import { STATE_DIR, stateFileForDevice, listStateFiles } from "./state";
 import { dirnameOf, sleepSync, isPortFree, servePreview } from "./runtime";
+import { startCloudflareTunnel, type Tunnel } from "./tunnel";
 
 // `import.meta.dir` is Bun-only; resolve once via fileURLToPath so the bundled
 // CLI works under plain `node` too.
 const __dirname = dirnameOf(import.meta.url);
+
+// Tunnels owned by this process. Killed on exit.
+const liveTunnels = new Set<Tunnel>();
+function trackTunnel(t: Tunnel): Tunnel {
+  liveTunnels.add(t);
+  return t;
+}
+function shutdownTunnels(): void {
+  for (const t of liveTunnels) {
+    try { t.stop(); } catch {}
+  }
+  liveTunnels.clear();
+}
+process.on("exit", shutdownTunnels);
+
+interface HelperUrls {
+  url: string;
+  streamUrl: string;
+  wsUrl: string;
+}
+
+/**
+ * URLs the preview UI uses to reach this helper. Defaults to
+ * `http://127.0.0.1:<port>`. When `publicUrl` is set (e.g. a tunnel base
+ * like `https://abc.trycloudflare.com`), it replaces the loopback origin.
+ */
+function buildHelperUrls(port: number, publicUrl?: string): HelperUrls {
+  if (publicUrl) {
+    const base = publicUrl.replace(/\/+$/, "");
+    const wsBase = base.replace(/^http(s?):/i, (_m, s) => `ws${s}:`);
+    return {
+      url: base,
+      streamUrl: `${base}/stream.mjpeg`,
+      wsUrl: `${wsBase}/ws`,
+    };
+  }
+  return {
+    url: `http://127.0.0.1:${port}`,
+    streamUrl: `http://127.0.0.1:${port}/stream.mjpeg`,
+    wsUrl: `ws://127.0.0.1:${port}/ws`,
+  };
+}
 
 // Embed the Swift helper so `bun build --compile` produces a self-contained
 // `serve-sim` binary. In dev / the un-compiled ESM bin the returned path is a
@@ -514,8 +557,8 @@ async function spawnHelperAttached(opts: SpawnHelperOptions): Promise<{
 async function startHelper(
   udid: string,
   port: number,
-  opts: { detach: boolean },
-): Promise<{ pid: number; child?: ChildProcess }> {
+  opts: { detach: boolean; tunnel?: boolean },
+): Promise<{ pid: number; child?: ChildProcess; tunnel?: Tunnel }> {
   await ensureBooted(udid);
 
   const host = "127.0.0.1";
@@ -526,39 +569,41 @@ async function startHelper(
   let lastLog = "";
   const MAX_ATTEMPTS = 2;
 
+  const finalize = async (
+    pid: number,
+    child?: ChildProcess,
+  ): Promise<{ pid: number; child?: ChildProcess; tunnel?: Tunnel }> => {
+    let tunnel: Tunnel | undefined;
+    if (opts.tunnel) {
+      try {
+        tunnel = trackTunnel(await startCloudflareTunnel(port));
+      } catch (err) {
+        try { process.kill(pid, "SIGTERM"); } catch {}
+        console.error(`Tunnel failed: ${(err as Error).message}`);
+        process.exit(1);
+      }
+    }
+    const state: ServerState = {
+      pid,
+      port,
+      device: udid,
+      ...buildHelperUrls(port, tunnel?.url),
+    };
+    writeState(state);
+    return { pid, child, tunnel };
+  };
+
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     killPortHolder(port);
 
     if (opts.detach) {
       const result = await spawnHelperDetached(spawnOpts);
-      if (result.ready) {
-        const state: ServerState = {
-          pid: result.pid,
-          port,
-          device: udid,
-          url: `http://${host}:${port}`,
-          streamUrl: `http://${host}:${port}/stream.mjpeg`,
-          wsUrl: `ws://${host}:${port}/ws`,
-        };
-        writeState(state);
-        return { pid: result.pid };
-      }
+      if (result.ready) return finalize(result.pid);
       stopProcess(result.pid);
       lastLog = result.log;
     } else {
       const result = await spawnHelperAttached(spawnOpts);
-      if (result.ready) {
-        const state: ServerState = {
-          pid: result.child.pid!,
-          port,
-          device: udid,
-          url: `http://${host}:${port}`,
-          streamUrl: `http://${host}:${port}/stream.mjpeg`,
-          wsUrl: `ws://${host}:${port}/ws`,
-        };
-        writeState(state);
-        return { pid: result.child.pid!, child: result.child };
-      }
+      if (result.ready) return finalize(result.child.pid!, result.child);
       stopProcess(result.child.pid!);
       lastLog = result.log;
     }
@@ -576,7 +621,7 @@ async function startHelper(
 // ─── Commands ───
 
 /** Foreground follow mode (default). Stays attached, cleans up on Ctrl+C. */
-async function follow(devices: string[], startPort: number, quiet: boolean) {
+async function follow(devices: string[], startPort: number, quiet: boolean, useTunnel?: boolean) {
   const udids = devices.length > 0
     ? devices.map(resolveDevice)
     : (() => {
@@ -613,20 +658,17 @@ async function follow(devices: string[], startPort: number, quiet: boolean) {
     }
 
     port = await findAvailablePort(port);
-    const { pid, child } = await startHelper(udid, port, { detach: false });
+    const { pid, child, tunnel } = await startHelper(udid, port, { detach: false, tunnel: useTunnel });
 
     if (child) {
       children.set(udid, child);
     }
 
-    const host = "127.0.0.1";
     const state: ServerState = {
       pid,
       port,
       device: udid,
-      url: `http://${host}:${port}`,
-      streamUrl: `http://${host}:${port}/stream.mjpeg`,
-      wsUrl: `ws://${host}:${port}/ws`,
+      ...buildHelperUrls(port, tunnel?.url),
     };
     states.push(state);
 
@@ -729,14 +771,11 @@ async function detach(devices: string[], startPort: number): Promise<ServerState
     port = await findAvailablePort(port);
     await startHelper(udid, port, { detach: true });
 
-    const host = "127.0.0.1";
     states.push({
       pid: readState(udid)!.pid,
       port,
       device: udid,
-      url: `http://${host}:${port}`,
-      streamUrl: `http://${host}:${port}/stream.mjpeg`,
-      wsUrl: `ws://${host}:${port}/ws`,
+      ...buildHelperUrls(port),
     });
 
     port++;
@@ -1049,10 +1088,37 @@ async function memoryWarning(args: string[]) {
 
 // ─── Serve preview ───
 
-async function serve(servePort: number, devices: string[], portExplicit: boolean) {
+async function serve(servePort: number, devices: string[], portExplicit: boolean, useTunnel?: boolean) {
   let targetDevice: string | undefined;
+  // Helpers we own in this process when --tunnel is set. With --tunnel we
+  // skip the daemon-style state reuse: tunnel URLs are session-scoped, so a
+  // fresh helper for each session is the right model.
+  const ownedHelpers: { udid: string; child: ChildProcess; tunnelUrl?: string }[] = [];
 
-  if (devices.length > 0) {
+  if (useTunnel) {
+    const udids = devices.length > 0
+      ? devices.map(resolveDevice)
+      : (() => {
+          const booted = findBootedDevice();
+          if (booted) return [booted];
+          const fallback = pickDefaultDevice();
+          if (!fallback) {
+            console.error("No device specified and no available iOS simulator found.");
+            process.exit(1);
+          }
+          console.log(`No booted simulator — booting ${fallback.name}...`);
+          return [fallback.udid];
+        })();
+
+    let helperPort = 3100;
+    for (const udid of udids) {
+      helperPort = await findAvailablePort(helperPort);
+      const { child, tunnel } = await startHelper(udid, helperPort, { detach: false, tunnel: true });
+      if (child) ownedHelpers.push({ udid, child, tunnelUrl: tunnel?.url });
+      helperPort++;
+    }
+    targetDevice = udids[0];
+  } else if (devices.length > 0) {
     const states = await detach(devices, 3100);
     targetDevice = states[0]?.device;
   } else {
@@ -1100,15 +1166,39 @@ async function serve(servePort: number, devices: string[], portExplicit: boolean
     process.exit(1);
   }
 
+  let previewTunnel: Tunnel | undefined;
+  if (useTunnel) {
+    try {
+      previewTunnel = trackTunnel(await startCloudflareTunnel(boundPort));
+    } catch (err) {
+      console.error(`Failed to start preview tunnel: ${(err as Error).message}`);
+      for (const h of ownedHelpers) {
+        if (h.child.pid) try { process.kill(h.child.pid, "SIGTERM"); } catch {}
+      }
+      process.exit(1);
+    }
+  }
+
   const networkIP = getLocalNetworkIP();
   console.log("");
   console.log(`  - Local:   http://localhost:${boundPort}`);
   if (networkIP) console.log(`  - Network: http://${networkIP}:${boundPort}`);
+  if (previewTunnel) console.log(`  - Tunnel:  ${previewTunnel.url}`);
+  for (const h of ownedHelpers) {
+    if (h.tunnelUrl) console.log(`  - Stream:  ${h.tunnelUrl}`);
+  }
   console.log("");
 
-  // Exit cleanly on Ctrl+C
-  process.on("SIGINT", () => process.exit(0));
-  process.on("SIGTERM", () => process.exit(0));
+  // Exit cleanly on Ctrl+C — kill owned helpers, tunnels are torn down by the
+  // process 'exit' handler registered at module load.
+  const cleanup = (code: number) => {
+    for (const h of ownedHelpers) {
+      if (h.child.pid) try { process.kill(h.child.pid, "SIGTERM"); } catch {}
+    }
+    process.exit(code);
+  };
+  process.on("SIGINT", () => cleanup(0));
+  process.on("SIGTERM", () => cleanup(0));
   await new Promise(() => {});
 }
 
@@ -1138,6 +1228,10 @@ Options:
   -d, --detach        Spawn helper and exit (daemon mode)
   -q, --quiet         Suppress human-readable output, JSON only
       --no-preview    Skip the web preview server; stream in foreground only
+      --tunnel        Open a Cloudflare quick tunnel for each port (preview +
+                      every helper). Public URLs are printed and used in the
+                      stream/WS URLs the preview UI loads. Requires
+                      \`cloudflared\` on PATH (brew install cloudflared).
       --list [device] List running streams
       --kill [device] Kill running stream(s)
   -h, --help          Show this help
@@ -1147,6 +1241,7 @@ Examples:
   serve-sim -p 8080                     Preview on a custom port
   serve-sim --no-preview                Auto-detect booted sim, stream in foreground
   serve-sim --no-preview "iPhone 16 Pro" Stream a specific device (no preview)
+  serve-sim --tunnel                    Host the preview + stream over Cloudflare tunnels
   serve-sim --detach                    Start streaming in background (daemon)
   serve-sim --list                      Show all running streams
   serve-sim --kill                      Stop all streams
@@ -1186,6 +1281,7 @@ let list = false;
 let kill = false;
 let help = false;
 let noPreview = false;
+let useTunnel = false;
 const positionalDevices: string[] = [];
 let listDevice: string | undefined;
 let killDevice: string | undefined;
@@ -1204,6 +1300,9 @@ for (let i = 0; i < argv.length; i++) {
       break;
     case "--no-preview":
       noPreview = true;
+      break;
+    case "--tunnel":
+      useTunnel = true;
       break;
     case "--list": case "-l":
       list = true;
@@ -1248,11 +1347,16 @@ if (kill) {
   process.exit(0);
 }
 
+if (useTunnel && detachMode) {
+  console.error("--tunnel cannot be combined with --detach yet (the tunnel needs a parent process to clean it up).");
+  process.exit(1);
+}
+
 if (detachMode) {
   const states = await detach(positionalDevices, startPort ?? 3100);
   printStatesJSON(states);
 } else if (noPreview) {
-  await follow(positionalDevices, startPort ?? 3100, quiet);
+  await follow(positionalDevices, startPort ?? 3100, quiet, useTunnel);
 } else {
-  await serve(startPort ?? 3200, positionalDevices, startPort !== undefined);
+  await serve(startPort ?? 3200, positionalDevices, startPort !== undefined, useTunnel);
 }
