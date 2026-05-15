@@ -7,7 +7,7 @@
     },
     "packages/serve-sim": {
       "name": "serve-sim-szdziedzic",
-      "version": "0.1.21",
+      "version": "0.1.23",
       "bin": {
         "serve-sim-szdziedzic": "dist/serve-sim.js",
       },
@@ -25,7 +25,7 @@
     },
     "packages/serve-sim-client": {
       "name": "serve-sim-client-szdziedzic",
-      "version": "0.1.15",
+      "version": "0.1.16",
       "dependencies": {
         "just-bash": "^2.14.0",
       },

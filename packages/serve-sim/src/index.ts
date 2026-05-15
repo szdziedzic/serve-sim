@@ -6,7 +6,7 @@ import { homedir, networkInterfaces } from "os";
 import { join, resolve } from "path";
 import { STATE_DIR, stateFileForDevice, listStateFiles } from "./state";
 import { dirnameOf, sleepSync, isPortFree, servePreview } from "./runtime";
-import { startCloudflareTunnel, type Tunnel } from "./tunnel";
+import { startCloudflareTunnel, type Tunnel, type TunnelProtocol } from "./tunnel";
 
 // `import.meta.dir` is Bun-only; resolve once via fileURLToPath so the bundled
 // CLI works under plain `node` too.
@@ -30,6 +30,31 @@ interface HelperUrls {
   url: string;
   streamUrl: string;
   wsUrl: string;
+}
+
+interface StreamOptions {
+  maxFps: number;
+  quality: number;
+  maxDimension: number;
+}
+
+const DEFAULT_STREAM_OPTIONS: StreamOptions = {
+  maxFps: 60,
+  quality: 0.7,
+  maxDimension: 0,
+};
+
+function buildHelperArgs(udid: string, port: number, stream: StreamOptions): string[] {
+  const args = [
+    udid,
+    "--port", String(port),
+    "--max-fps", String(stream.maxFps),
+    "--quality", String(stream.quality),
+  ];
+  if (stream.maxDimension > 0) {
+    args.push("--max-dimension", String(stream.maxDimension));
+  }
+  return args;
 }
 
 /**
@@ -445,6 +470,7 @@ interface SpawnHelperOptions {
   port: number;
   host: string;
   logFile: string;
+  stream: StreamOptions;
 }
 
 /** Wait for the helper to become ready (health check + capture started). */
@@ -494,12 +520,12 @@ async function spawnHelperDetached(opts: SpawnHelperOptions): Promise<{
   exited: boolean;
   log: string;
 }> {
-  const { helperPath, udid, port, host, logFile } = opts;
+  const { helperPath, udid, port, host, logFile, stream } = opts;
   const url = `http://${host}:${port}`;
 
   ensureStateDir();
   const logFd = openSync(logFile, "w");
-  const child = nodeSpawn(helperPath, [udid, "--port", String(port)], {
+  const child = nodeSpawn(helperPath, buildHelperArgs(udid, port, stream), {
     detached: true,
     stdio: ["ignore", logFd, logFd],
     env: helperSpawnEnv(),
@@ -527,12 +553,12 @@ async function spawnHelperAttached(opts: SpawnHelperOptions): Promise<{
   child: ChildProcess;
   log: string;
 }> {
-  const { helperPath, udid, port, host, logFile } = opts;
+  const { helperPath, udid, port, host, logFile, stream } = opts;
   const url = `http://${host}:${port}`;
 
   ensureStateDir();
   const logFd = openSync(logFile, "w");
-  const child = nodeSpawn(helperPath, [udid, "--port", String(port)], {
+  const child = nodeSpawn(helperPath, buildHelperArgs(udid, port, stream), {
     detached: false,
     stdio: ["ignore", logFd, logFd],
     env: helperSpawnEnv(),
@@ -557,14 +583,15 @@ async function spawnHelperAttached(opts: SpawnHelperOptions): Promise<{
 async function startHelper(
   udid: string,
   port: number,
-  opts: { detach: boolean; tunnel?: boolean },
+  opts: { detach: boolean; tunnel?: boolean; stream?: StreamOptions; tunnelProtocol?: TunnelProtocol },
 ): Promise<{ pid: number; child?: ChildProcess; tunnel?: Tunnel }> {
   await ensureBooted(udid);
 
   const host = "127.0.0.1";
   const helperPath = findHelperBinary();
   const logFile = join(STATE_DIR, `server-${udid}.log`);
-  const spawnOpts: SpawnHelperOptions = { helperPath, udid, port, host, logFile };
+  const stream = opts.stream ?? DEFAULT_STREAM_OPTIONS;
+  const spawnOpts: SpawnHelperOptions = { helperPath, udid, port, host, logFile, stream };
 
   let lastLog = "";
   const MAX_ATTEMPTS = 2;
@@ -576,7 +603,7 @@ async function startHelper(
     let tunnel: Tunnel | undefined;
     if (opts.tunnel) {
       try {
-        tunnel = trackTunnel(await startCloudflareTunnel(port));
+        tunnel = trackTunnel(await startCloudflareTunnel(port, { protocol: opts.tunnelProtocol }));
       } catch (err) {
         try { process.kill(pid, "SIGTERM"); } catch {}
         console.error(`Tunnel failed: ${(err as Error).message}`);
@@ -621,7 +648,14 @@ async function startHelper(
 // ─── Commands ───
 
 /** Foreground follow mode (default). Stays attached, cleans up on Ctrl+C. */
-async function follow(devices: string[], startPort: number, quiet: boolean, useTunnel?: boolean) {
+async function follow(
+  devices: string[],
+  startPort: number,
+  quiet: boolean,
+  useTunnel?: boolean,
+  stream: StreamOptions = DEFAULT_STREAM_OPTIONS,
+  tunnelProtocol?: TunnelProtocol,
+) {
   const udids = devices.length > 0
     ? devices.map(resolveDevice)
     : (() => {
@@ -658,7 +692,12 @@ async function follow(devices: string[], startPort: number, quiet: boolean, useT
     }
 
     port = await findAvailablePort(port);
-    const { pid, child, tunnel } = await startHelper(udid, port, { detach: false, tunnel: useTunnel });
+    const { pid, child, tunnel } = await startHelper(udid, port, {
+      detach: false,
+      tunnel: useTunnel,
+      stream,
+      tunnelProtocol,
+    });
 
     if (child) {
       children.set(udid, child);
@@ -744,7 +783,11 @@ async function follow(devices: string[], startPort: number, quiet: boolean, useT
 }
 
 /** Detach mode (--detach). Spawns helpers and returns their states. */
-async function detach(devices: string[], startPort: number): Promise<ServerState[]> {
+async function detach(
+  devices: string[],
+  startPort: number,
+  stream: StreamOptions = DEFAULT_STREAM_OPTIONS,
+): Promise<ServerState[]> {
   const udids = devices.length > 0
     ? devices.map(resolveDevice)
     : (() => {
@@ -769,7 +812,7 @@ async function detach(devices: string[], startPort: number): Promise<ServerState
     }
 
     port = await findAvailablePort(port);
-    await startHelper(udid, port, { detach: true });
+    await startHelper(udid, port, { detach: true, stream });
 
     states.push({
       pid: readState(udid)!.pid,
@@ -1088,7 +1131,14 @@ async function memoryWarning(args: string[]) {
 
 // ─── Serve preview ───
 
-async function serve(servePort: number, devices: string[], portExplicit: boolean, useTunnel?: boolean) {
+async function serve(
+  servePort: number,
+  devices: string[],
+  portExplicit: boolean,
+  useTunnel?: boolean,
+  stream: StreamOptions = DEFAULT_STREAM_OPTIONS,
+  tunnelProtocol?: TunnelProtocol,
+) {
   let targetDevice: string | undefined;
   // Helpers we own in this process when --tunnel is set. With --tunnel we
   // skip the daemon-style state reuse: tunnel URLs are session-scoped, so a
@@ -1113,13 +1163,18 @@ async function serve(servePort: number, devices: string[], portExplicit: boolean
     let helperPort = 3100;
     for (const udid of udids) {
       helperPort = await findAvailablePort(helperPort);
-      const { child, tunnel } = await startHelper(udid, helperPort, { detach: false, tunnel: true });
+      const { child, tunnel } = await startHelper(udid, helperPort, {
+        detach: false,
+        tunnel: true,
+        stream,
+        tunnelProtocol,
+      });
       if (child) ownedHelpers.push({ udid, child, tunnelUrl: tunnel?.url });
       helperPort++;
     }
     targetDevice = udids[0];
   } else if (devices.length > 0) {
-    const states = await detach(devices, 3100);
+    const states = await detach(devices, 3100, stream);
     targetDevice = states[0]?.device;
   } else {
     // Ensure a serve-sim stream is running (start one if not)
@@ -1128,7 +1183,7 @@ async function serve(servePort: number, devices: string[], portExplicit: boolean
       targetDevice = existing[0]?.device;
     } else {
       console.log("Starting simulator stream...");
-      const states = await detach(devices, 3100);
+      const states = await detach(devices, 3100, stream);
       targetDevice = states[0]?.device;
     }
   }
@@ -1169,7 +1224,7 @@ async function serve(servePort: number, devices: string[], portExplicit: boolean
   let previewTunnel: Tunnel | undefined;
   if (useTunnel) {
     try {
-      previewTunnel = trackTunnel(await startCloudflareTunnel(boundPort));
+      previewTunnel = trackTunnel(await startCloudflareTunnel(boundPort, { protocol: tunnelProtocol }));
     } catch (err) {
       console.error(`Failed to start preview tunnel: ${(err as Error).message}`);
       for (const h of ownedHelpers) {
@@ -1228,10 +1283,18 @@ Options:
   -d, --detach        Spawn helper and exit (daemon mode)
   -q, --quiet         Suppress human-readable output, JSON only
       --no-preview    Skip the web preview server; stream in foreground only
+      --stream-fps <fps>
+                      Max stream FPS (1-60, default: 60)
+      --stream-quality <value>
+                      JPEG quality (0.1-1.0, default: 0.7)
+      --stream-max-dimension <px>
+                      Downscale longest stream edge to px (default: native)
       --tunnel        Open a Cloudflare quick tunnel for each port (preview +
                       every helper). Public URLs are printed and used in the
                       stream/WS URLs the preview UI loads. Requires
                       \`cloudflared\` on PATH (brew install cloudflared).
+      --tunnel-protocol <auto|quic|http2>
+                      cloudflared edge protocol (default: auto)
       --list [device] List running streams
       --kill [device] Kill running stream(s)
   -h, --help          Show this help
@@ -1242,6 +1305,8 @@ Examples:
   serve-sim --no-preview                Auto-detect booted sim, stream in foreground
   serve-sim --no-preview "iPhone 16 Pro" Stream a specific device (no preview)
   serve-sim --tunnel                    Host the preview + stream over Cloudflare tunnels
+  serve-sim --tunnel --tunnel-protocol quic --stream-max-dimension 1280 --stream-quality 0.55
+                                        Lower tunnel bandwidth while keeping 60 fps
   serve-sim --detach                    Start streaming in background (daemon)
   serve-sim --list                      Show all running streams
   serve-sim --kill                      Stop all streams
@@ -1282,6 +1347,8 @@ let kill = false;
 let help = false;
 let noPreview = false;
 let useTunnel = false;
+let tunnelProtocol: TunnelProtocol | undefined;
+const streamOptions: StreamOptions = { ...DEFAULT_STREAM_OPTIONS };
 const positionalDevices: string[] = [];
 let listDevice: string | undefined;
 let killDevice: string | undefined;
@@ -1301,9 +1368,45 @@ for (let i = 0; i < argv.length; i++) {
     case "--no-preview":
       noPreview = true;
       break;
+    case "--stream-fps": {
+      const value = parseInt(argv[++i] ?? "", 10);
+      if (!Number.isFinite(value) || value < 1 || value > 60) {
+        console.error("--stream-fps must be an integer from 1 to 60.");
+        process.exit(1);
+      }
+      streamOptions.maxFps = value;
+      break;
+    }
+    case "--stream-quality": {
+      const value = Number(argv[++i] ?? "");
+      if (!Number.isFinite(value) || value < 0.1 || value > 1) {
+        console.error("--stream-quality must be a number from 0.1 to 1.0.");
+        process.exit(1);
+      }
+      streamOptions.quality = value;
+      break;
+    }
+    case "--stream-max-dimension": {
+      const value = parseInt(argv[++i] ?? "", 10);
+      if (!Number.isFinite(value) || value < 0) {
+        console.error("--stream-max-dimension must be a non-negative integer.");
+        process.exit(1);
+      }
+      streamOptions.maxDimension = value;
+      break;
+    }
     case "--tunnel":
       useTunnel = true;
       break;
+    case "--tunnel-protocol": {
+      const value = argv[++i];
+      if (value !== "auto" && value !== "quic" && value !== "http2") {
+        console.error("--tunnel-protocol must be one of: auto, quic, http2.");
+        process.exit(1);
+      }
+      tunnelProtocol = value;
+      break;
+    }
     case "--list": case "-l":
       list = true;
       // Optional device arg after --list
@@ -1353,10 +1456,10 @@ if (useTunnel && detachMode) {
 }
 
 if (detachMode) {
-  const states = await detach(positionalDevices, startPort ?? 3100);
+  const states = await detach(positionalDevices, startPort ?? 3100, streamOptions);
   printStatesJSON(states);
 } else if (noPreview) {
-  await follow(positionalDevices, startPort ?? 3100, quiet, useTunnel);
+  await follow(positionalDevices, startPort ?? 3100, quiet, useTunnel, streamOptions, tunnelProtocol);
 } else {
-  await serve(startPort ?? 3200, positionalDevices, startPort !== undefined, useTunnel);
+  await serve(startPort ?? 3200, positionalDevices, startPort !== undefined, useTunnel, streamOptions, tunnelProtocol);
 }

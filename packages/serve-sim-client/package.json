@@ -1,7 +1,7 @@
 {
   "name": "serve-sim-client-szdziedzic",
   "description": "Client library for serve-sim — iOS Simulator streaming and gateway protocol.",
-  "version": "0.1.15",
+  "version": "0.1.16",
   "type": "module",
   "main": "src/index.ts",
   "types": "src/index.ts",

@@ -75,14 +75,14 @@ export function SimulatorView({
   onStreamMultiTouch,
   onStreamButton,
   subscribeFrame,
-  streamFrame,
   streamConfig,
   onScreenConfigChange,
   hideControls,
   onStreamingChange,
   connectionQuality,
 }: SimulatorViewProps) {
-  const relayMode = !!onStreamTouch;
+  const inputRelayMode = !!onStreamTouch;
+  const frameRelayMode = !!subscribeFrame;
   const imgRef = useRef<HTMLImageElement | null>(null);
   const relayImgRef = useRef<HTMLImageElement | null>(null);
   const surfaceRef = useRef<HTMLDivElement | null>(null);
@@ -136,6 +136,9 @@ export function SimulatorView({
   useEffect(() => {
     screenSizeRef.current = null;
     setScreenSize(null);
+    setConnected(false);
+    setError(null);
+    frameCountRef.current = 0;
   }, [url]);
 
   const updateScreenConfig = useCallback((config: StreamConfig | null | undefined) => {
@@ -165,19 +168,20 @@ export function SimulatorView({
     onStreamingChangeRef.current?.(connected);
   }, [connected]);
 
-  // In relay mode, use streamConfig for screen size
+  // Use caller-provided stream config when available. The built-in preview
+  // polls /config itself while still letting the browser render MJPEG natively.
   useEffect(() => {
-    if (relayMode && streamConfig) {
+    if (streamConfig) {
       updateScreenConfig(streamConfig);
     }
-  }, [relayMode, streamConfig, updateScreenConfig]);
+  }, [streamConfig, updateScreenConfig]);
 
   // In relay mode, subscribe to frames and update img.src directly (bypasses React)
   const connectedRef = useRef(false);
   connectedRef.current = connected;
   const prevBlobUrlRef = useRef<string | null>(null);
   useEffect(() => {
-    if (!relayMode || !subscribeFrame) return;
+    if (!frameRelayMode || !subscribeFrame) return;
     // Startup watchdog: flag the stream as broken if no frame arrives within
     // the window. Catches the silent-failure mode where the helper accepts
     // the MJPEG connection but its underlying simulator was shut down —
@@ -214,7 +218,7 @@ export function SimulatorView({
         prevBlobUrlRef.current = null;
       }
     };
-  }, [relayMode, subscribeFrame]);
+  }, [frameRelayMode, subscribeFrame]);
 
   const sendTouch = useCallback(
     (touch: {
@@ -232,7 +236,7 @@ export function SimulatorView({
       const payload =
         edge === undefined ? { type: touch.type, ...point } : { type: touch.type, ...point, edge };
 
-      if (relayMode) {
+      if (inputRelayMode) {
         onStreamTouch?.(payload);
         return;
       }
@@ -244,11 +248,11 @@ export function SimulatorView({
       msg.set(json, 1);
       ws.send(msg);
     },
-    [relayMode, onStreamTouch],
+    [inputRelayMode, onStreamTouch],
   );
 
   const sendButton = useCallback((button: string) => {
-    if (relayMode) {
+    if (inputRelayMode) {
       onStreamButton?.(button);
       return;
     }
@@ -259,7 +263,7 @@ export function SimulatorView({
     msg[0] = WS_MSG_BUTTON;
     msg.set(json, 1);
     ws.send(msg);
-  }, [relayMode, onStreamButton]);
+  }, [inputRelayMode, onStreamButton]);
 
   const sendMultiTouch = useCallback(
     (touch: {
@@ -280,7 +284,7 @@ export function SimulatorView({
         y2: p2.y,
       };
 
-      if (relayMode) {
+      if (inputRelayMode) {
         onStreamMultiTouch?.(payload);
         return;
       }
@@ -292,12 +296,12 @@ export function SimulatorView({
       msg.set(json, 1);
       ws.send(msg);
     },
-    [relayMode, onStreamMultiTouch],
+    [inputRelayMode, onStreamMultiTouch],
   );
 
   useEffect(() => {
-    // In relay mode, skip direct WS/MJPEG connections
-    if (relayMode) return;
+    // Blob-frame relay mode owns its own frame/config lifecycle.
+    if (frameRelayMode) return;
 
     // Poll config so direct consumers follow orientation changes even when
     // multipart <img> load events do not fire for each frame.
@@ -313,93 +317,102 @@ export function SimulatorView({
     fetchConfig();
     const configInterval = setInterval(fetchConfig, 1000);
 
-    // Connect WebSocket for touch input
-    const wsUrl = wsUrlProp ?? url.replace(/^http/, "ws") + "/ws";
-    const ws = new WebSocket(wsUrl);
-    ws.binaryType = "arraybuffer";
-    wsRef.current = ws;
+    let ws: WebSocket | null = null;
+    if (!inputRelayMode) {
+      // Connect WebSocket for touch input
+      const wsUrl = wsUrlProp ?? url.replace(/^http/, "ws") + "/ws";
+      ws = new WebSocket(wsUrl);
+      ws.binaryType = "arraybuffer";
+      wsRef.current = ws;
 
-    ws.onopen = () => {
-      setConnected(true);
-      setError(null);
-    };
-    ws.onclose = () => {
-      setConnected(false);
-    };
-    ws.onerror = () => {
-      setError("WebSocket connection failed");
-      setConnected(false);
-    };
+      ws.onopen = () => {
+        setConnected(true);
+        setError(null);
+      };
+      ws.onclose = () => {
+        setConnected(false);
+      };
+      ws.onerror = () => {
+        setError("WebSocket connection failed");
+        setConnected(false);
+      };
+    }
 
-    // FPS counter: read MJPEG boundary markers
     const fpsAbort = new AbortController();
-    const fpsInterval = setInterval(() => {
-      setFps(frameCountRef.current);
-      frameCountRef.current = 0;
-    }, 1000);
-
-    // Startup watchdog: if we open the MJPEG socket but never see a frame
-    // boundary, surface a real error instead of leaving the user staring at
-    // a blank <img>. This catches the "helper bound to shutdown sim" case
-    // where bytes never arrive.
+    let fpsInterval: ReturnType<typeof setInterval> | null = null;
+    let startupWatchdog: ReturnType<typeof setTimeout> | null = null;
     let sawAnyFrame = false;
-    const startupWatchdog = setTimeout(() => {
-      if (!sawAnyFrame) {
-        setError("Stream is not producing frames. The simulator may have stopped — try reconnecting.");
-      }
-    }, 6000);
 
-    (async () => {
-      try {
-        const res = await fetch(streamUrl, { signal: fpsAbort.signal });
-        const reader = res.body?.getReader();
-        if (!reader) return;
-        const boundary = new TextEncoder().encode("--frame");
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          if (value) {
-            for (let i = 0; i <= value.length - boundary.length; i++) {
-              let match = true;
-              for (let j = 0; j < boundary.length; j++) {
-                if (value[i + j] !== boundary[j]) {
-                  match = false;
-                  break;
+    if (!hideControls) {
+      // FPS counter: read MJPEG boundary markers. This opens a second stream,
+      // so skip it for chrome-less previews where the FPS label is hidden.
+      fpsInterval = setInterval(() => {
+        setFps(frameCountRef.current);
+        frameCountRef.current = 0;
+      }, 1000);
+
+      // Startup watchdog: if we open the MJPEG socket but never see a frame
+      // boundary, surface a real error instead of leaving the user staring at
+      // a blank <img>. This catches the "helper bound to shutdown sim" case
+      // where bytes never arrive.
+      startupWatchdog = setTimeout(() => {
+        if (!sawAnyFrame) {
+          setError("Stream is not producing frames. The simulator may have stopped — try reconnecting.");
+        }
+      }, 6000);
+
+      (async () => {
+        try {
+          const res = await fetch(streamUrl, { signal: fpsAbort.signal });
+          const reader = res.body?.getReader();
+          if (!reader) return;
+          const boundary = new TextEncoder().encode("--frame");
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            if (value) {
+              for (let i = 0; i <= value.length - boundary.length; i++) {
+                let match = true;
+                for (let j = 0; j < boundary.length; j++) {
+                  if (value[i + j] !== boundary[j]) {
+                    match = false;
+                    break;
+                  }
                 }
-              }
-              if (match) {
-                frameCountRef.current++;
-                if (!sawAnyFrame) {
-                  sawAnyFrame = true;
-                  clearTimeout(startupWatchdog);
+                if (match) {
+                  frameCountRef.current++;
+                  if (!sawAnyFrame) {
+                    sawAnyFrame = true;
+                    if (startupWatchdog) clearTimeout(startupWatchdog);
+                  }
                 }
               }
             }
           }
+        } catch {
+          // aborted on cleanup
         }
-      } catch {
-        // aborted on cleanup
-      }
-    })();
+      })();
+    }
 
     return () => {
       fpsAbort.abort();
       configAbort.abort();
       clearInterval(configInterval);
-      clearInterval(fpsInterval);
-      clearTimeout(startupWatchdog);
-      ws.close();
-      wsRef.current = null;
+      if (fpsInterval) clearInterval(fpsInterval);
+      if (startupWatchdog) clearTimeout(startupWatchdog);
+      ws?.close();
+      if (wsRef.current === ws) wsRef.current = null;
     };
-  }, [url, streamUrl, relayMode, updateScreenConfig, wsUrlProp]);
+  }, [url, streamUrl, frameRelayMode, inputRelayMode, hideControls, updateScreenConfig, wsUrlProp]);
 
-  // FPS counter + stale-frame detection for relay mode.
+  // FPS counter + stale-frame detection for blob-frame relay mode.
   // Unlike non-relay mode (where WS close flips connected=false), relay mode
   // only knows the stream is alive when frames arrive. Without this, killing
   // the upstream helper leaves the UI stuck on "live" forever.
   const lastFrameAtRef = useRef(0);
   useEffect(() => {
-    if (!relayMode) return;
+    if (!frameRelayMode) return;
     const STALE_MS = 2000;
     const checkStaleness = () => {
       const last = lastFrameAtRef.current;
@@ -420,11 +433,11 @@ export function SimulatorView({
       clearInterval(interval);
       document.removeEventListener("visibilitychange", onVis);
     };
-  }, [relayMode]);
+  }, [frameRelayMode]);
 
   const getViewElement = useCallback(() => {
-    return relayMode ? relayImgRef.current : imgRef.current;
-  }, [relayMode]);
+    return frameRelayMode ? relayImgRef.current : imgRef.current;
+  }, [frameRelayMode]);
 
   const getInputRect = useCallback(() => {
     return surfaceRef.current?.getBoundingClientRect()
@@ -641,19 +654,31 @@ export function SimulatorView({
         >
         <img
           ref={imgRef}
-          src={relayMode ? undefined : streamUrl}
+          alt=""
+          src={frameRelayMode ? undefined : streamUrl}
           draggable={false}
           onLoad={(e) => {
             const el = e.currentTarget;
             if (el.naturalWidth > 0 && el.naturalHeight > 0) {
               updateScreenConfig({ width: el.naturalWidth, height: el.naturalHeight });
             }
+            if (!frameRelayMode && !connectedRef.current) {
+              setConnected(true);
+              setError(null);
+            }
           }}
-          style={relayMode ? { display: "none" } : streamImageStyle}
+          onError={() => {
+            if (!frameRelayMode) {
+              setError("Stream image failed to load");
+              setConnected(false);
+            }
+          }}
+          style={frameRelayMode ? { display: "none" } : streamImageStyle}
         />
-        {relayMode && (
+        {frameRelayMode && (
           <img
             ref={relayImgRef}
+            alt=""
             draggable={false}
             onLoad={(e) => {
               const el = e.currentTarget;

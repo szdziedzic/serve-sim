@@ -33,31 +33,14 @@ import {
 import { LocationEmulationTool } from "./LocationEmulationTool";
 import { Panel, PanelCloseButton, PanelHeader, PanelTitle } from "./Panel";
 
-/**
- * Fetches an MJPEG stream and parses out individual JPEG frames as blob URLs.
- * Chrome doesn't support multipart/x-mixed-replace in <img> tags,
- * so we manually read the stream and extract JPEG boundaries.
- */
-function useMjpegStream(streamUrl: string | null) {
+function useStreamConfig(baseUrl: string | null) {
   const [config, setConfig] = useState<StreamConfig | null>(null);
-  const subscribersRef = useRef<Set<(blobUrl: string) => void>>(new Set());
-
-  const subscribeFrame = useCallback(
-    (cb: (blobUrl: string) => void) => {
-      subscribersRef.current.add(cb);
-      return () => { subscribersRef.current.delete(cb); };
-    },
-    [],
-  );
 
   useEffect(() => {
-    if (!streamUrl) return;
+    if (!baseUrl) return;
     const controller = new AbortController();
-    let stopped = false;
-    let retryTimer: ReturnType<typeof setTimeout> | null = null;
 
     // Poll config for screen dimensions + requested orientation.
-    const baseUrl = streamUrl.replace(/\/stream\.mjpeg$/, "");
     const applyConfig = (c: StreamConfig) => {
       if (c.width <= 0 || c.height <= 0) return;
       setConfig((prev) =>
@@ -78,96 +61,13 @@ function useMjpegStream(streamUrl: string | null) {
     fetchConfig();
     const configInterval = setInterval(fetchConfig, 1000);
 
-    // Read the MJPEG stream and extract JPEG frames.
-    // ?raw=1 tells the server to use Content-Type application/octet-stream
-    // instead of multipart/x-mixed-replace; WebKit refuses to expose
-    // multipart bodies to fetch()'s ReadableStream.
-    const fetchUrlObj = new URL(streamUrl);
-    fetchUrlObj.searchParams.set("raw", "1");
-    const fetchUrl = fetchUrlObj.toString();
-    const scheduleRetry = () => {
-      if (stopped || controller.signal.aborted || retryTimer) return;
-      retryTimer = setTimeout(() => {
-        retryTimer = null;
-        void readStream();
-      }, 1000);
-    };
-    const readStream = async () => {
-      try {
-        const res = await fetch(fetchUrl, { signal: controller.signal });
-        const reader = res.body?.getReader();
-        if (!reader) {
-          scheduleRetry();
-          return;
-        }
-
-        let buffer = new Uint8Array(0);
-
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-
-          // Append new data
-          const newBuf = new Uint8Array(buffer.length + value.length);
-          newBuf.set(buffer);
-          newBuf.set(value, buffer.length);
-          buffer = newBuf;
-
-          // Look for JPEG frames: find Content-Length or JPEG markers (FFD8...FFD9)
-          // Simpler approach: split on boundary markers and extract JPEG data
-          while (true) {
-            // Find first JPEG start (FF D8)
-            let jpegStart = -1;
-            for (let i = 0; i < buffer.length - 1; i++) {
-              if (buffer[i] === 0xff && buffer[i + 1] === 0xd8) {
-                jpegStart = i;
-                break;
-              }
-            }
-            if (jpegStart === -1) break;
-
-            // Find JPEG end (FF D9) after the start
-            let jpegEnd = -1;
-            for (let i = jpegStart + 2; i < buffer.length - 1; i++) {
-              if (buffer[i] === 0xff && buffer[i + 1] === 0xd9) {
-                jpegEnd = i + 2;
-                break;
-              }
-            }
-            if (jpegEnd === -1) break;
-
-            // Extract the JPEG frame
-            const jpeg = buffer.slice(jpegStart, jpegEnd);
-            buffer = buffer.slice(jpegEnd);
-
-            const blob = new Blob([jpeg], { type: "image/jpeg" });
-            const blobUrl = URL.createObjectURL(blob);
-            if (subscribersRef.current.size === 0) {
-              URL.revokeObjectURL(blobUrl);
-              continue;
-            }
-            for (const cb of subscribersRef.current) {
-              cb(blobUrl);
-            }
-          }
-        }
-      } catch {
-        // Aborted or network error
-      } finally {
-        scheduleRetry();
-      }
-    };
-    void readStream();
-
     return () => {
-      stopped = true;
-      if (retryTimer) clearTimeout(retryTimer);
       controller.abort();
       clearInterval(configInterval);
     };
-  }, [streamUrl]);
+  }, [baseUrl]);
 
-  return { subscribeFrame, frame: null, config };
+  return config;
 }
 
 
@@ -2800,10 +2700,9 @@ function App() {
     setSelectedDevtoolsTargetId(null);
   }, [config.device]);
 
-  // Parse MJPEG stream into individual frames (Chrome doesn't support multipart/x-mixed-replace in <img>)
-  const mjpeg = useMjpegStream(config.streamUrl);
+  const streamConfig = useStreamConfig(config.url);
   const [liveStreamConfig, setLiveStreamConfig] = useState<StreamConfig | null>(null);
-  const activeStreamConfig = liveStreamConfig ?? mjpeg.config ?? fallbackScreenSize(deviceType, selectedDevice?.name);
+  const activeStreamConfig = liveStreamConfig ?? streamConfig ?? fallbackScreenSize(deviceType, selectedDevice?.name);
   const imgBorderRadius = screenBorderRadius(deviceType, activeStreamConfig);
   const frameMaxWidth = simulatorMaxWidth(deviceType, activeStreamConfig);
   const frameAspectRatio = simulatorAspectRatio(activeStreamConfig);
@@ -2883,7 +2782,7 @@ function App() {
   }, [config.streamUrl]);
 
   useEffect(() => {
-    const confirmedConfig = mjpeg.config;
+    const confirmedConfig = streamConfig;
     if (!confirmedConfig) return;
     setLiveStreamConfig((prev) =>
       prev &&
@@ -2893,7 +2792,7 @@ function App() {
         ? prev
         : null,
     );
-  }, [mjpeg.config?.width, mjpeg.config?.height, mjpeg.config?.orientation]);
+  }, [streamConfig?.width, streamConfig?.height, streamConfig?.orientation]);
 
   const sendKey = useCallback((type: "down" | "up", usage: number) => {
     sendWs(0x06, { type, usage });
@@ -3239,8 +3138,6 @@ function App() {
             onStreamTouch={onStreamTouch}
             onStreamMultiTouch={onStreamMultiTouch}
             onStreamButton={onStreamButton}
-            subscribeFrame={mjpeg.subscribeFrame}
-            streamFrame={mjpeg.frame}
             streamConfig={activeStreamConfig}
             onScreenConfigChange={onScreenConfigChange}
           />

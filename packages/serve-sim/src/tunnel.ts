@@ -11,6 +11,8 @@ export interface Tunnel {
   stop(): void;
 }
 
+export type TunnelProtocol = "auto" | "quic" | "http2";
+
 const TRYCLOUDFLARE_RE = /https:\/\/[a-z0-9-]+\.trycloudflare\.com/;
 const DEFAULT_TIMEOUT_MS = 30_000;
 
@@ -25,21 +27,24 @@ const NOT_FOUND_HINT =
  */
 export function startCloudflareTunnel(
   port: number,
-  opts?: { timeoutMs?: number },
+  opts?: { timeoutMs?: number; protocol?: TunnelProtocol },
 ): Promise<Tunnel> {
   const timeoutMs = opts?.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const protocol = opts?.protocol;
 
   return new Promise<Tunnel>((resolve, reject) => {
     let child: ChildProcess;
+    const args = [
+      "tunnel",
+      "--no-autoupdate",
+      ...(protocol ? ["--protocol", protocol] : []),
+      "--url",
+      `http://localhost:${port}`,
+    ];
     try {
       child = spawn(
         "cloudflared",
-        [
-          "tunnel",
-          "--no-autoupdate",
-          "--url",
-          `http://localhost:${port}`,
-        ],
+        args,
         { stdio: ["ignore", "pipe", "pipe"] },
       );
     } catch (err) {
